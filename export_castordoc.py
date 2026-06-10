@@ -1,77 +1,36 @@
-"""
-export_castordoc.py
+# export_castordoc.py
 
+"""
 CastorDoc / Coalesce documentation exporter.
 
-Purpose
--------
-This script opens CastorDoc with Playwright, lets the user log in manually,
-then exports documentation pages as clean .txt files.
+Responsibilities:
+- Open CastorDoc with Playwright.
+- Allow manual login.
+- Export ReadMe pages as TXT files.
+- Follow ReadMe links.
+- Discover Subpages & Map / Knowledge tiles.
+- Avoid drifting into global CastorDoc navigation/sidebar.
+- Optionally generate an Excel model specification workbook.
 
-It is intentionally responsible only for:
-- browser automation;
-- CastorDoc navigation;
-- ReadMe extraction;
-- link crawling;
-- TXT export;
-- optional call to Excel generation after the TXT export is complete.
-
-It does NOT build the Excel workbook directly. That logic lives in:
-    excel_exporter.py
-
-Main crawl rules
-----------------
-For each page:
-1. Go to /home.
-2. Save only the ReadMe content.
-3. Follow only links found inside the ReadMe content.
-4. If depth allows it, go to Subpages & Map and collect Knowledge tiles.
-5. If a page has "0 Subpages & Map", keep only the ReadMe and do not crawl tiles.
-6. Avoid breadcrumbs, top menu, sidebars, comments, history, etc.
-
-Default depth behaviour
------------------------
-Depth 0, 1, 2:
-    - save ReadMe;
-    - follow ReadMe links;
-    - explore Subpages & Map Knowledge tiles.
-
-Depth 3:
-    - save ReadMe only;
-    - do not follow more ReadMe links;
-    - do not explore Subpages.
-
-Usage with uv
--------------
-Single root page:
-
-    uv run python export_castordoc.py \
-      --root-url "https://app.castordoc.com/terms/internal/xxx/home" \
-      --generate-excel
-
-Multiple root pages:
-
-    uv run python export_castordoc.py \
-      --root-url "URL_1" \
-      --root-url "URL_2" \
-      --generate-excel
-
-From a text file:
-
-    uv run python export_castordoc.py \
-      --root-urls-file root_urls.txt \
-      --generate-excel
+Important scope rule:
+- ReadMe links are collected only inside the ReadMe content.
+- Knowledge tiles are collected only from visible typed cards:
+  [A], [AC], [C], [Dim], [Fact], [F], [FCT]
+- Sidebar/global navigation such as Organization, Metrics, Dimensions, FAQ
+  must never be crawled as Knowledge tiles.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 import traceback
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from playwright.sync_api import (
@@ -83,18 +42,19 @@ from playwright.sync_api import (
 from excel_exporter import build_excel_overview
 
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 # ============================================================
-# ARGUMENTS
+# CLI
 # ============================================================
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse CLI arguments.
-
-    The script can be used directly from terminal or indirectly from Streamlit.
-    Streamlit writes root URLs into a temporary file and passes that file here.
-    """
     parser = argparse.ArgumentParser(
         description="Export CastorDoc / Coalesce ReadMe documentation pages."
     )
@@ -103,10 +63,7 @@ def parse_args() -> argparse.Namespace:
         "--root-url",
         action="append",
         default=[],
-        help=(
-            "CastorDoc root documentation URL. Can be passed multiple times. "
-            "Usually the /map or /home page containing the main requirements."
-        ),
+        help="CastorDoc root documentation URL. Can be passed multiple times.",
     )
 
     parser.add_argument(
@@ -124,10 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile-dir",
         default="playwright_profile",
-        help=(
-            "Persistent Playwright browser profile directory. "
-            "This keeps the login session between runs."
-        ),
+        help="Persistent Playwright browser profile directory.",
     )
 
     parser.add_argument(
@@ -139,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=250,
+        default=300,
         help="Safety limit: maximum number of pages to visit.",
     )
 
@@ -147,10 +101,7 @@ def parse_args() -> argparse.Namespace:
         "--max-depth",
         type=int,
         default=3,
-        help=(
-            "Maximum crawl depth. Default 3. "
-            "At max depth, the page ReadMe is saved but no further links/subpages are explored."
-        ),
+        help="Maximum crawl depth.",
     )
 
     parser.add_argument(
@@ -163,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--generate-excel",
         action="store_true",
-        help="Generate an Excel overview workbook after the TXT export is complete.",
+        help="Generate Excel workbook after TXT export.",
     )
 
     parser.add_argument(
@@ -176,14 +127,14 @@ def parse_args() -> argparse.Namespace:
 
 
 # ============================================================
-# GLOBAL CONFIG SET AT RUNTIME
+# GLOBAL CONFIG
 # ============================================================
 
 BASE_URL = "https://app.castordoc.com"
 PROFILE_DIR = "playwright_profile"
 OUTPUT_DIR = Path("Output")
 
-MAX_PAGES = 250
+MAX_PAGES = 300
 MAX_DEPTH = 3
 SUBPAGES_UNTIL_DEPTH = 2
 
@@ -198,15 +149,6 @@ DEFAULT_TIMEOUT_MS = 10_000
 
 @dataclass(frozen=True)
 class CrawlItem:
-    """
-    One URL waiting to be visited.
-
-    source_type:
-        root            = URL pasted by user
-        readme_link     = URL found inside a ReadMe
-        knowledge_tile  = URL found under Subpages & Map / Knowledge
-    """
-
     url: str
     source_type: str
     depth: int
@@ -215,16 +157,6 @@ class CrawlItem:
 
 @dataclass
 class ReadMeExtraction:
-    """
-    Result of extracting a page's ReadMe.
-
-    content:
-        Clean business documentation text.
-
-    readme_links:
-        CastorDoc links found only inside the ReadMe content area.
-    """
-
     title: str
     content: str
     readme_links: list[str]
@@ -236,17 +168,25 @@ class ReadMeExtraction:
 
 
 def log(message: str) -> None:
-    """Print logs immediately so Streamlit can display them live."""
-    print(message, flush=True)
+    text = str(message)
+
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_text = text.encode(encoding, errors="replace").decode(
+            encoding,
+            errors="replace",
+        )
+        print(safe_text, flush=True)
 
 
 # ============================================================
-# URL + FILE HELPERS
+# URL HELPERS
 # ============================================================
 
 
 def clean_filename(text: str) -> str:
-    """Convert a page title into a safe filename fragment."""
     text = text or "page"
     text = text.strip()
     text = re.sub(r"[^\w\-À-ÿ ]", "_", text)
@@ -256,14 +196,6 @@ def clean_filename(text: str) -> str:
 
 
 def normalize_url(href: str | None) -> str | None:
-    """
-    Normalize a CastorDoc URL.
-
-    Important:
-    - /map is useful for discovering subpages.
-    - /home is useful for exporting the ReadMe.
-    - The crawler stores canonical /home URLs to avoid duplicates.
-    """
     if not href:
         return None
 
@@ -276,20 +208,11 @@ def normalize_url(href: str | None) -> str | None:
 
 
 def as_map_url(url: str) -> str:
-    """Convert a canonical /home URL into /map for Subpages & Map exploration."""
     normalized = normalize_url(url) or url
     return re.sub(r"/home$", "/map", normalized)
 
 
 def is_castordoc_internal_term_url(url: str | None) -> bool:
-    """
-    Keep only useful CastorDoc internal documentation pages.
-
-    This avoids:
-    - external links;
-    - SAP generated technical links;
-    - lineage/query/settings/comments/history pages.
-    """
     if not url:
         return False
 
@@ -302,12 +225,9 @@ def is_castordoc_internal_term_url(url: str | None) -> bool:
     if "/terms/internal/" not in path:
         return False
 
-    # Ignore SAP / technical generated internal pages.
-    # Example: /terms/internal/-xxxx/...
     if re.search(r"/terms/internal/-[^/]+", path):
         return False
 
-    # Keep only documentation page endpoints.
     if not (path.endswith("/home") or path.endswith("/map")):
         return False
 
@@ -326,8 +246,19 @@ def is_castordoc_internal_term_url(url: str | None) -> bool:
     return True
 
 
+def dedupe_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+
+    return result
+
+
 def read_root_urls_from_file(path: str | None) -> list[str]:
-    """Read one root URL per line from a text file."""
     if not path:
         return []
 
@@ -352,21 +283,7 @@ def read_root_urls_from_file(path: str | None) -> list[str]:
     return urls
 
 
-def dedupe_keep_order(values: list[str]) -> list[str]:
-    """Remove duplicates without changing order."""
-    seen = set()
-    result = []
-
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-
-    return result
-
-
 def unique_output_path(title: str, counter: int, source_type: str, depth: int) -> Path:
-    """Build a stable output path for one exported documentation page."""
     clean_title = clean_filename(title)
     clean_source_type = clean_filename(source_type)
     filename = f"{counter:03d}_d{depth}_{clean_source_type}_{clean_title}.txt"
@@ -383,51 +300,155 @@ def unique_output_path(title: str, counter: int, source_type: str, depth: int) -
 
 
 # ============================================================
+# INTERNAL URL EXTRACTION FROM NETWORK JSON ONLY
+# ============================================================
+
+
+def extract_internal_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+
+    patterns = [
+        r"https?://[^\"'<>\s]+/terms/internal/[^\"'<>\s]+",
+        r"/terms/internal/[^\"'<>\s]+",
+    ]
+
+    urls: list[str] = []
+
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            clean = match.strip().rstrip("),.;]}\"'")
+            normalized = normalize_url(clean)
+
+            if is_castordoc_internal_term_url(normalized):
+                urls.append(normalized)
+
+    return dedupe_keep_order(urls)
+
+
+def extract_internal_urls_from_any(value: Any) -> list[str]:
+    urls: list[str] = []
+
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        return extract_internal_urls_from_text(value)
+
+    if isinstance(value, dict):
+        for item in value.values():
+            urls.extend(extract_internal_urls_from_any(item))
+        return dedupe_keep_order(urls)
+
+    if isinstance(value, list):
+        for item in value:
+            urls.extend(extract_internal_urls_from_any(item))
+        return dedupe_keep_order(urls)
+
+    return []
+
+
+def start_network_capture(page) -> dict[str, Any]:
+    """
+    Capture only likely API/JSON responses.
+
+    These links are treated as weak hints only.
+    They are NOT enough by themselves to crawl, because broad API/page-state
+    extraction can drift into the global CastorDoc Knowledge sidebar.
+    """
+    state: dict[str, Any] = {
+        "links": set(),
+        "responses": [],
+    }
+
+    interesting_url_keywords = [
+        "term",
+        "terms",
+        "knowledge",
+        "subpage",
+        "children",
+        "catalog",
+        "coalesce",
+        "castor",
+        "graphql",
+        "api",
+    ]
+
+    def handle_response(response) -> None:
+        try:
+            response_url = response.url
+            lower_url = response_url.lower()
+            content_type = response.headers.get("content-type", "").lower()
+
+            if not any(keyword in lower_url for keyword in interesting_url_keywords):
+                return
+
+            if "json" not in content_type and "graphql" not in lower_url and "api" not in lower_url:
+                return
+
+            try:
+                payload = response.json()
+            except Exception:
+                try:
+                    payload = response.text()
+                except Exception:
+                    return
+
+            links = extract_internal_urls_from_any(payload)
+
+            for link in links:
+                state["links"].add(link)
+
+            if links:
+                state["responses"].append(
+                    {
+                        "url": response_url,
+                        "links_count": len(links),
+                    }
+                )
+
+        except Exception:
+            return
+
+    page.on("response", handle_response)
+
+    return state
+
+
+# ============================================================
 # PLAYWRIGHT HELPERS
 # ============================================================
 
 
 def safe_goto(page, url: str, label: str = "") -> bool:
-    """
-    Navigate to a URL without crashing the whole export on timeout.
-
-    Returns True if navigation looked successful, False otherwise.
-    """
     label_text = f" [{label}]" if label else ""
 
     try:
         log(f"Navigation{label_text}: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
         page.wait_for_load_state("domcontentloaded", timeout=15_000)
-        page.wait_for_timeout(2_000)
         return True
 
     except PlaywrightTimeoutError as error:
         log(f"Timeout navigation{label_text}: {url}")
         log(f"  Detail: {error}")
-        page.wait_for_timeout(5_000)
+        page.wait_for_timeout(3_000)
         return False
 
     except PlaywrightError as error:
         log(f"Erreur Playwright navigation{label_text}: {url}")
         log(f"  Detail: {error}")
-        page.wait_for_timeout(5_000)
+        page.wait_for_timeout(3_000)
         return False
 
     except Exception as error:
         log(f"Erreur inattendue navigation{label_text}: {url}")
         log(f"  Detail: {error}")
-        page.wait_for_timeout(5_000)
+        page.wait_for_timeout(3_000)
         return False
 
 
 def wait_until_logged_in(page, timeout_seconds: int = 240) -> None:
-    """
-    Wait for manual CastorDoc login.
-
-    Browser is visible by default, so the user can authenticate manually.
-    The persistent profile normally prevents needing to log in again later.
-    """
     log("")
     log("Connexion CastorDoc")
     log("Si une page de login apparaît, connecte-toi manuellement dans Chromium.")
@@ -462,21 +483,15 @@ def wait_until_logged_in(page, timeout_seconds: int = 240) -> None:
 
 
 def safe_click_text(page, pattern: str, timeout: int = 5_000) -> bool:
-    """Click the first visible element matching text regex. Return False if not found."""
     try:
         page.get_by_text(re.compile(pattern, re.IGNORECASE)).first.click(timeout=timeout)
-        page.wait_for_timeout(1_200)
+        page.wait_for_timeout(1_000)
         return True
     except Exception:
         return False
 
 
 def click_readme_tab(page) -> None:
-    """
-    Click the ReadMe tab if visible.
-
-    If not found, the script still tries to extract from the current page.
-    """
     clicked = (
         safe_click_text(page, r"^Read\s*Me$")
         or safe_click_text(page, r"ReadMe")
@@ -488,18 +503,26 @@ def click_readme_tab(page) -> None:
     else:
         log("Onglet ReadMe non trouvé. Extraction depuis la page actuelle.")
 
-    page.wait_for_timeout(1_000)
+    page.wait_for_timeout(700)
+
+
+def click_subpages_tab(page) -> bool:
+    clicked = (
+        safe_click_text(page, r"\d+\+?\s*Subpages\s*&\s*Map")
+        or safe_click_text(page, r"Subpages\s*&\s*Map")
+        or safe_click_text(page, r"\d+\+?\s*Subpages")
+    )
+
+    if clicked:
+        log("Onglet Subpages/Map ouvert.")
+        page.wait_for_timeout(1_200)
+        return True
+
+    log("Onglet Subpages/Map non trouvé.")
+    return False
 
 
 def get_subpages_count_from_page(page) -> int | None:
-    """
-    Read the "Subpages & Map" tab label.
-
-    Examples:
-    - "0 Subpages & Map"   -> 0
-    - "30+ Subpages & Map" -> 30
-    - "Subpages & Map"     -> None
-    """
     try:
         labels = page.evaluate(
             """
@@ -523,36 +546,7 @@ def get_subpages_count_from_page(page) -> int | None:
     return None
 
 
-def click_subpages_tab(page) -> bool:
-    """
-    Click Subpages & Map.
-
-    Returns:
-    - True if clicked.
-    - False if not found.
-
-    Note:
-    The page may show "0 Subpages & Map". The caller checks the count before
-    collecting Knowledge tiles.
-    """
-    clicked = (
-        safe_click_text(page, r"\d+\+?\s*Subpages\s*&\s*Map")
-        or safe_click_text(page, r"Subpages\s*&\s*Map")
-        or safe_click_text(page, r"Subpages")
-        or safe_click_text(page, r"Map")
-    )
-
-    if clicked:
-        log("Onglet Subpages/Map ouvert.")
-        page.wait_for_timeout(1_500)
-        return True
-
-    log("Onglet Subpages/Map non trouvé.")
-    return False
-
-
 def get_page_title(page) -> str:
-    """Best-effort page title extraction."""
     selectors = [
         "h1",
         "[data-testid*='title']",
@@ -562,10 +556,28 @@ def get_page_title(page) -> str:
     for selector in selectors:
         try:
             value = page.locator(selector).first.inner_text(timeout=3_000).strip()
-            if value and len(value) <= 200:
+
+            if value and len(value) <= 200 and value.lower() not in {"details", "domain"}:
                 return value
         except Exception:
             pass
+
+    try:
+        body_text = page.locator("body").inner_text(timeout=3_000)
+
+        for pattern in [
+            r"✅\s*\[Dim\]\s*([^\n]+)",
+            r"✅\s*\[Fact\]\s*([^\n]+)",
+            r"✅\s*\[F\]\s*([^\n]+)",
+            r"✅\s*\[C\]\s*([^\n]+)",
+            r"✅\s*\[A\]\s*([^\n]+)",
+            r"✅\s*\[AC\]\s*([^\n]+)",
+        ]:
+            match = re.search(pattern, body_text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    except Exception:
+        pass
 
     try:
         return page.title().strip() or "page"
@@ -574,17 +586,11 @@ def get_page_title(page) -> str:
 
 
 # ============================================================
-# README-SCOPED EXTRACTION
+# README EXTRACTION
 # ============================================================
 
 
 def extract_readme_content_and_links(page) -> ReadMeExtraction:
-    """
-    Extract only the ReadMe business content and links inside that content.
-
-    This deliberately avoids extracting links from the full page DOM because
-    that caused drift into sidebars, breadcrumbs, top navigation, comments, etc.
-    """
     click_readme_tab(page)
     title = get_page_title(page)
 
@@ -617,7 +623,6 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
                 const lower = text.toLowerCase();
                 let score = text.length;
 
-                // Positive signs that this is the business documentation area.
                 if (lower.includes("coalesce catalog description")) score += 2000;
                 if (lower.includes("definition & purpose")) score += 1500;
                 if (lower.includes("business concepts")) score += 1000;
@@ -625,8 +630,8 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
                 if (lower.includes("examples of values")) score += 1000;
                 if (lower.includes("concept :")) score += 500;
                 if (lower.includes("concepts :")) score += 500;
+                if (lower.includes("key attributes")) score += 500;
 
-                // Negative signs that this is navigation or metadata.
                 if (lower.includes("subpages & map")) score -= 2000;
                 if (lower.includes("comments")) score -= 500;
                 if (lower.includes("history")) score -= 500;
@@ -664,7 +669,6 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
             let container = candidates.length ? candidates[0].el : document.body;
             let text = cleanText(container.innerText || "");
 
-            // Remove obvious top navigation prefix if present.
             const startMarkers = [
                 "Coalesce Catalog Description",
                 "🎯 Definition & purpose",
@@ -689,7 +693,6 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
                 text = text.slice(startIndex).trim();
             }
 
-            // Cut obvious page metadata / right panel / bottom sections.
             const stopMarkers = [
                 "\\nDetails",
                 "\\nOwners",
@@ -721,7 +724,6 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
                     if (!item.href) return false;
                     if (!item.href.includes("/terms/internal/")) return false;
 
-                    // Avoid tabs and common UI links.
                     if ([
                         "read me",
                         "comments",
@@ -755,11 +757,7 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
     links: list[str] = []
 
     for item in raw_links:
-        if isinstance(item, dict):
-            href = item.get("href")
-        else:
-            href = str(item)
-
+        href = item.get("href") if isinstance(item, dict) else str(item)
         url = normalize_url(href)
 
         if is_castordoc_internal_term_url(url):
@@ -773,7 +771,6 @@ def extract_readme_content_and_links(page) -> ReadMeExtraction:
 
 
 def clean_extracted_readme_text(text: str) -> str:
-    """Post-process ReadMe text to remove remaining UI fragments."""
     if not text:
         return ""
 
@@ -788,10 +785,9 @@ def clean_extracted_readme_text(text: str) -> str:
         flags=re.IGNORECASE,
     ).strip()
 
-    lines = text.splitlines()
     cleaned_lines = []
 
-    for line in lines:
+    for line in text.splitlines():
         clean_line = line.strip()
 
         if not clean_line:
@@ -815,36 +811,347 @@ def clean_extracted_readme_text(text: str) -> str:
 
 
 # ============================================================
-# SUBPAGES / KNOWLEDGE TILE EXTRACTION
+# KNOWLEDGE TILE EXTRACTION
 # ============================================================
 
 
+def is_allowed_knowledge_title(title: str) -> bool:
+    """
+    Only typed CastorDoc Knowledge cards are allowed.
+
+    This prevents drifting into left-side global navigation:
+    Organization, Apps and Reports, Metrics, Dimensions, FAQ, etc.
+    """
+    clean = (title or "").strip()
+
+    return bool(
+        re.match(
+            r"^\[(A|AC|C|Dim|DIM|Fact|FACT|F|FCT)\]\s+",
+            clean,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def mark_visible_knowledge_tiles(page) -> list[dict]:
+    """
+    Detect only visible typed Knowledge tiles/cards.
+
+    A card must have a visible typed title:
+    [A], [AC], [C], [Dim], [Fact], [F], [FCT]
+    """
+    return page.evaluate(
+        """
+        () => {
+            function visible(el) {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.visibility !== "hidden" &&
+                    style.display !== "none"
+                );
+            }
+
+            function cleanText(text) {
+                return (text || "")
+                    .replace(/\\r/g, "")
+                    .replace(/\\n{2,}/g, "\\n")
+                    .trim();
+            }
+
+            function isBadCardText(text) {
+                const lower = text.toLowerCase();
+
+                return (
+                    lower.includes("create a subpage") ||
+                    lower.includes("knowledge map") ||
+                    lower.includes("access to the lineage") ||
+                    lower === "read me" ||
+                    lower === "comments" ||
+                    lower === "history" ||
+                    lower === "subpages & map"
+                );
+            }
+
+            function getTitle(text) {
+                const lines = text
+                    .split("\\n")
+                    .map(x => x.trim())
+                    .filter(Boolean);
+
+                for (const line of lines) {
+                    if (/^\\[(A|AC|C|Dim|DIM|Fact|FACT|F|FCT)\\]\\s+/i.test(line)) {
+                        return line;
+                    }
+                }
+
+                return "";
+            }
+
+            function looksLikeKnowledgeTile(text) {
+                const title = getTitle(text);
+
+                if (!title) return false;
+
+                const lower = text.toLowerCase();
+
+                return (
+                    lower.includes("draft") ||
+                    lower.includes("domain") ||
+                    lower.includes("edited") ||
+                    lower.includes("no description") ||
+                    lower.includes("documentation_")
+                );
+            }
+
+            function findCardRoot(el) {
+                let current = el;
+
+                for (let i = 0; i < 8; i++) {
+                    if (!current || !current.parentElement) break;
+
+                    const parent = current.parentElement;
+                    const rect = parent.getBoundingClientRect();
+                    const text = cleanText(parent.innerText || "");
+
+                    if (
+                        rect.width >= 250 &&
+                        rect.height >= 80 &&
+                        looksLikeKnowledgeTile(text) &&
+                        !isBadCardText(text)
+                    ) {
+                        current = parent;
+                    } else {
+                        break;
+                    }
+                }
+
+                return current;
+            }
+
+            Array.from(document.querySelectorAll("[data-castordoc-export-tile]"))
+                .forEach(el => el.removeAttribute("data-castordoc-export-tile"));
+
+            const rawElements = Array.from(document.querySelectorAll("a, button, div"))
+                .filter(visible);
+
+            const cards = [];
+            const seenTitles = new Set();
+
+            for (const el of rawElements) {
+                const root = findCardRoot(el);
+                const text = cleanText(root.innerText || "");
+
+                if (!text) continue;
+                if (isBadCardText(text)) continue;
+                if (!looksLikeKnowledgeTile(text)) continue;
+
+                const title = getTitle(text);
+
+                if (!title) continue;
+
+                const key = title.toLowerCase();
+
+                if (seenTitles.has(key)) continue;
+                seenTitles.add(key);
+
+                const anchor = root.querySelector("a[href*='/terms/internal/']");
+                const href = anchor ? anchor.href : "";
+
+                const index = cards.length;
+                root.setAttribute("data-castordoc-export-tile", String(index));
+
+                cards.push({
+                    index,
+                    title,
+                    href,
+                    text: text.slice(0, 500)
+                });
+            }
+
+            return cards;
+        }
+        """
+    )
+
+
+def collect_knowledge_tile_links_from_metadata(
+    page,
+    page_url: str,
+    network_state: dict[str, Any],
+) -> list[str]:
+    """
+    Safe metadata extraction.
+
+    Do NOT scan full page HTML/localStorage/global state here.
+    That drifts into the global sidebar.
+
+    We trust metadata only when it can be associated with visible typed cards.
+    """
+    current_home = normalize_url(page_url)
+
+    visible_cards = mark_visible_knowledge_tiles(page)
+
+    visible_href_links = []
+
+    for card in visible_cards:
+        title = (card.get("title") or "").strip()
+        href = card.get("href") or ""
+
+        if not is_allowed_knowledge_title(title):
+            continue
+
+        url = normalize_url(href)
+
+        if url and url != current_home and is_castordoc_internal_term_url(url):
+            visible_href_links.append(url)
+
+    if visible_href_links:
+        return dedupe_keep_order(visible_href_links)
+
+    allowed_card_count = len(
+        [
+            card
+            for card in visible_cards
+            if is_allowed_knowledge_title(card.get("title") or "")
+        ]
+    )
+
+    links = []
+
+    for link in network_state.get("links", set()):
+        normalized = normalize_url(link)
+
+        if not normalized:
+            continue
+
+        if normalized == current_home:
+            continue
+
+        if not is_castordoc_internal_term_url(normalized):
+            continue
+
+        links.append(normalized)
+
+    # If network returns many links unrelated to visible cards, do not trust it.
+    if allowed_card_count and len(links) <= allowed_card_count + 5:
+        return dedupe_keep_order(links)
+
+    return []
+
+
+def collect_knowledge_tile_links_by_scrolling(page, page_url: str, map_url: str) -> list[str]:
+    found_links: list[str] = []
+    seen_titles: set[str] = set()
+
+    for scroll_round in range(35):
+        page.wait_for_timeout(700)
+
+        candidates = mark_visible_knowledge_tiles(page)
+
+        log(
+            f"Scan Knowledge tiles round {scroll_round + 1}/35 "
+            f"- candidates visibles: {len(candidates)} "
+            f"- total URLs: {len(found_links)}"
+        )
+
+        clicked_card_this_round = False
+
+        for candidate in candidates:
+            title = (candidate.get("title") or "").strip()
+            href = candidate.get("href") or ""
+            index = candidate.get("index")
+
+            if not title:
+                continue
+
+            if not is_allowed_knowledge_title(title):
+                continue
+
+            title_key = title.lower()
+
+            if title_key in seen_titles:
+                continue
+
+            seen_titles.add(title_key)
+
+            if href:
+                url = normalize_url(href)
+
+                if is_castordoc_internal_term_url(url) and url not in found_links:
+                    found_links.append(url)
+                    log(f"Knowledge tile href trouvé: {title} -> {url}")
+
+                continue
+
+            try:
+                locator = page.locator(f"[data-castordoc-export-tile='{index}']").first
+                old_url = page.url
+
+                locator.click(timeout=5_000)
+                page.wait_for_timeout(2_000)
+
+                new_url = normalize_url(page.url)
+
+                if (
+                    new_url
+                    and new_url != normalize_url(old_url)
+                    and is_castordoc_internal_term_url(new_url)
+                    and new_url not in found_links
+                ):
+                    found_links.append(new_url)
+                    log(f"Knowledge tile cliqué: {title} -> {new_url}")
+                else:
+                    log(f"Tile cliqué mais aucune URL utile détectée: {title}")
+
+                safe_goto(page, map_url, "return subpages map")
+                click_subpages_tab(page)
+
+                if scroll_round > 0:
+                    page.mouse.wheel(0, 900 * scroll_round)
+                    page.wait_for_timeout(600)
+
+                clicked_card_this_round = True
+                break
+
+            except Exception as error:
+                log(f"Impossible de cliquer la Knowledge tile '{title}': {error}")
+                continue
+
+        if clicked_card_this_round:
+            continue
+
+        page.mouse.wheel(0, 900)
+        page.wait_for_timeout(600)
+
+    current_home = normalize_url(page_url)
+
+    return dedupe_keep_order(
+        [
+            url
+            for url in found_links
+            if url != current_home
+        ]
+    )
+
+
 def collect_knowledge_tile_links(page, page_url: str) -> list[str]:
-    """
-    Open Subpages & Map and collect only visible CastorDoc Knowledge tiles/cards.
-
-    Rules:
-    - If the page has 0 subpages, return [] immediately.
-    - Do not collect "Create a subpage".
-    - Do not collect "Knowledge Map".
-    - Do not collect breadcrumbs/topbar/sidebar links.
-    """
-    subpage_count = get_subpages_count_from_page(page)
-
-    if subpage_count == 0:
-        log("0 Subpages détecté. On garde uniquement le ReadMe.")
-        return []
-
     map_url = as_map_url(page_url)
+    network_state = start_network_capture(page)
 
     ok = safe_goto(page, map_url, "subpages map")
     if not ok:
         return []
 
+    page.wait_for_timeout(2_000)
+
     subpage_count = get_subpages_count_from_page(page)
 
     if subpage_count == 0:
-        log("0 Subpages détecté sur la page map. On garde uniquement le ReadMe.")
+        log("0 Subpages détecté. On garde uniquement le ReadMe.")
         return []
 
     clicked = click_subpages_tab(page)
@@ -852,120 +1159,30 @@ def collect_knowledge_tile_links(page, page_url: str) -> list[str]:
     if not clicked:
         return []
 
-    found_links: list[str] = []
+    page.wait_for_timeout(2_000)
 
-    for scroll_round in range(30):
-        page.wait_for_timeout(700)
+    metadata_links = collect_knowledge_tile_links_from_metadata(
+        page,
+        page_url,
+        network_state,
+    )
 
-        raw_links = page.evaluate(
-            """
-            () => {
-                function visible(el) {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== "hidden" &&
-                        style.display !== "none"
-                    );
-                }
+    log(
+        f"Metadata/API safe links trouvés: {len(metadata_links)} "
+        f"(subpage_count={subpage_count})"
+    )
 
-                function cleanText(text) {
-                    return (text || "")
-                        .replace(/\\r/g, "")
-                        .replace(/\\n{2,}/g, "\\n")
-                        .trim();
-                }
+    if metadata_links and subpage_count is not None and len(metadata_links) >= subpage_count:
+        log(f"Knowledge tiles via metadata/API sûre: {len(metadata_links)}")
+        return metadata_links
 
-                const links = Array.from(document.querySelectorAll("a[href]"))
-                    .filter(visible)
-                    .filter(a => (a.href || "").includes("/terms/internal/"))
-                    .map(a => {
-                        const text = cleanText(a.innerText || a.textContent || "");
-                        const rect = a.getBoundingClientRect();
+    scroll_links = collect_knowledge_tile_links_by_scrolling(page, page_url, map_url)
 
-                        let container = a;
-                        for (let i = 0; i < 5; i++) {
-                            if (!container.parentElement) break;
-                            container = container.parentElement;
-                        }
+    all_links = dedupe_keep_order(metadata_links + scroll_links)
 
-                        const containerText = cleanText(container.innerText || "");
+    log(f"Knowledge tiles finales trouvées: {len(all_links)}")
 
-                        return {
-                            href: a.href,
-                            text,
-                            containerText,
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height
-                        };
-                    });
-
-                return links.filter(item => {
-                    const text = item.text.toLowerCase();
-                    const containerText = item.containerText.toLowerCase();
-
-                    // Explicitly ignore CastorDoc utility cards.
-                    if (containerText.includes("create a subpage")) return false;
-                    if (containerText.includes("knowledge map")) return false;
-                    if (containerText.includes("access to the lineage")) return false;
-
-                    // Ignore tab/nav/common UI links.
-                    const badText = [
-                        "read me",
-                        "comments",
-                        "history",
-                        "subpages & map",
-                        "knowledge",
-                        "coalesce catalog",
-                        "create a subpage",
-                        "knowledge map"
-                    ].includes(text);
-
-                    if (badText) return false;
-
-                    // Real Knowledge tiles usually contain one of these markers.
-                    const looksLikeKnowledgeTile =
-                        containerText.includes("draft") ||
-                        containerText.includes("domain") ||
-                        containerText.includes("edited") ||
-                        containerText.includes("no description") ||
-                        containerText.includes("documentation_");
-
-                    if (!looksLikeKnowledgeTile) return false;
-
-                    return true;
-                });
-            }
-            """
-        )
-
-        for item in raw_links:
-            href = item.get("href") if isinstance(item, dict) else None
-            url = normalize_url(href)
-
-            if is_castordoc_internal_term_url(url) and url not in found_links:
-                found_links.append(url)
-                label = item.get("text", "") if isinstance(item, dict) else ""
-                log(f"Knowledge tile trouvé: {label} -> {url}")
-
-        page.mouse.wheel(0, 900)
-        page.wait_for_timeout(700)
-
-        log(f"Scan Knowledge tiles round {scroll_round + 1}/30 - total: {len(found_links)}")
-
-    current_home = normalize_url(page_url)
-
-    found_links = [
-        url for url in found_links
-        if url != current_home
-    ]
-
-    return dedupe_keep_order(found_links)
+    return all_links
 
 
 # ============================================================
@@ -982,7 +1199,6 @@ def save_page(
     parent_url: str | None,
     content: str,
 ) -> None:
-    """Save one ReadMe page as a .txt file with metadata header."""
     parent_line = parent_url or ""
 
     path.write_text(
@@ -1007,7 +1223,6 @@ def write_summary(
     failed_urls: list[tuple[str, str]],
     counters: dict[str, int],
 ) -> None:
-    """Write export_summary.txt for auditability and Excel generation."""
     summary_path = OUTPUT_DIR / "export_summary.txt"
 
     summary_lines = [
@@ -1046,7 +1261,6 @@ def write_summary(
 
 
 def build_initial_queue(root_urls: list[str]) -> deque[CrawlItem]:
-    """Build the initial queue from user-provided root URLs."""
     queue: deque[CrawlItem] = deque()
 
     for root_url in root_urls:
@@ -1079,7 +1293,6 @@ def add_to_queue(
     depth: int,
     parent_url: str,
 ) -> bool:
-    """Add a URL to the crawl queue if valid and not already processed."""
     normalized = normalize_url(url)
 
     if not is_castordoc_internal_term_url(normalized):
@@ -1103,7 +1316,6 @@ def add_to_queue(
 
 
 def run_export(root_urls: list[str], headless: bool = False) -> None:
-    """Main export loop."""
     visited_urls: set[str] = set()
     saved_urls: set[str] = set()
     queued_urls: set[str] = set()
@@ -1214,7 +1426,6 @@ def run_export(root_urls: list[str], headless: bool = False) -> None:
                         skipped_duplicate_urls.add(current_url)
                         log(f"Déjà sauvegardé: {current_url}")
 
-                    # Rule 1: follow only links found inside the ReadMe.
                     if item.depth < MAX_DEPTH:
                         readme_links = extraction.readme_links
                         counters["readme_links_discovered"] += len(readme_links)
@@ -1246,9 +1457,19 @@ def run_export(root_urls: list[str], headless: bool = False) -> None:
                             "Aucun lien ReadMe supplémentaire ajouté."
                         )
 
-                    # Rule 2: explore Knowledge tiles only if depth allows it.
                     if item.depth <= SUBPAGES_UNTIL_DEPTH:
-                        knowledge_links = collect_knowledge_tile_links(page, current_url)
+                        try:
+                            knowledge_links = collect_knowledge_tile_links(page, current_url)
+                        except Exception as error:
+                            knowledge_links = []
+                            failed_urls.append(
+                                (
+                                    current_url,
+                                    f"knowledge tile crawl failed: {type(error).__name__}: {error}",
+                                )
+                            )
+                            log(f"Knowledge tile crawl failed but export continues: {error}")
+
                         counters["knowledge_tiles_discovered"] += len(knowledge_links)
 
                         added_knowledge_links = 0
@@ -1319,7 +1540,6 @@ def run_export(root_urls: list[str], headless: bool = False) -> None:
 
 
 def main() -> None:
-    """Entry point."""
     global BASE_URL
     global PROFILE_DIR
     global OUTPUT_DIR

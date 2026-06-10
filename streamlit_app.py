@@ -1,25 +1,7 @@
+# streamlit_app.py
+
 """
-streamlit_app.py
-
 Customer-friendly Streamlit UI for the CastorDoc exporter.
-
-Responsibilities
-----------------
-This file is only responsible for the user interface:
-- collect root URLs from the user;
-- run export_castordoc.py as a subprocess;
-- show logs and export results;
-- provide download buttons for TXT ZIP and Excel overview.
-
-It does NOT scrape CastorDoc itself.
-It does NOT build the Excel workbook itself.
-
-The exporter generates Excel automatically because Streamlit passes:
-    --generate-excel
-
-Usage with uv
--------------
-    uv run streamlit run streamlit_app.py
 """
 
 from __future__ import annotations
@@ -35,10 +17,6 @@ from pathlib import Path
 import streamlit as st
 
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-
 st.set_page_config(
     page_title="CastorDoc Exporter",
     page_icon="📚",
@@ -46,26 +24,16 @@ st.set_page_config(
 )
 
 
-# ============================================================
-# DEFAULT SETTINGS
-# ============================================================
-
 DEFAULT_OUTPUT_ROOT = "Output"
 DEFAULT_PROFILE_DIR = "playwright_profile"
-DEFAULT_MAX_PAGES = 250
+DEFAULT_MAX_PAGES = 300
 DEFAULT_MAX_DEPTH = 3
 DEFAULT_SUBPAGES_UNTIL_DEPTH = 2
 
-EXCEL_FILE_NAME = "castordoc_documentation_overview.xlsx"
-
-
-# ============================================================
-# FILE HELPERS
-# ============================================================
+EXCEL_FILE_NAME = "castordoc_model_specification.xlsx"
 
 
 def get_latest_export_folder(output_root: Path) -> Path | None:
-    """Return the most recently modified CastorDoc export folder."""
     if not output_root.exists():
         return None
 
@@ -82,7 +50,6 @@ def get_latest_export_folder(output_root: Path) -> Path | None:
 
 
 def list_export_folders(output_root: Path) -> list[Path]:
-    """List previous export folders newest first."""
     if not output_root.exists():
         return []
 
@@ -98,7 +65,6 @@ def list_export_folders(output_root: Path) -> list[Path]:
 
 
 def list_txt_files(folder_path: Path) -> list[Path]:
-    """List exported documentation TXT files, excluding export_summary.txt."""
     if not folder_path or not folder_path.exists():
         return []
 
@@ -110,7 +76,6 @@ def list_txt_files(folder_path: Path) -> list[Path]:
 
 
 def zip_folder(folder_path: Path) -> Path:
-    """Zip an export folder so the user can download all TXT files."""
     zip_path = folder_path.with_suffix(".zip")
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -122,7 +87,6 @@ def zip_folder(folder_path: Path) -> Path:
 
 
 def read_text_file(path: Path) -> str:
-    """Read a text file safely for preview in Streamlit."""
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -132,7 +96,6 @@ def read_text_file(path: Path) -> str:
 
 
 def parse_urls_from_text(text: str) -> list[str]:
-    """Parse one URL per line from the Streamlit textarea."""
     urls = []
 
     for line in text.splitlines():
@@ -149,11 +112,6 @@ def parse_urls_from_text(text: str) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-# ============================================================
-# COMMAND BUILDING
-# ============================================================
-
-
 def build_command(
     python_runner: str,
     exporter_path: Path,
@@ -164,12 +122,6 @@ def build_command(
     max_depth: int,
     subpages_until_depth: int,
 ) -> list[str]:
-    """
-    Build the command used to launch export_castordoc.py.
-
-    We run the exporter as a subprocess instead of importing it directly because
-    Playwright + visible Chromium is more reliable outside Streamlit's rerun cycle.
-    """
     if python_runner == "uv run python":
         command_prefix = ["uv", "run", "python"]
     elif python_runner == "current python":
@@ -196,13 +148,7 @@ def build_command(
     ]
 
 
-# ============================================================
-# SUMMARY PARSING FOR UI
-# ============================================================
-
-
 def parse_summary_metrics(summary_text: str, fallback_file_count: int) -> dict[str, str]:
-    """Parse export_summary.txt into user-facing metrics."""
     metrics = {
         "Root pages": "0",
         "ReadMe links": "0",
@@ -233,7 +179,6 @@ def parse_summary_metrics(summary_text: str, fallback_file_count: int) -> dict[s
 
 
 def show_summary_cards(summary_text: str, fallback_file_count: int) -> None:
-    """Display export KPIs as Streamlit metric cards."""
     metrics = parse_summary_metrics(summary_text, fallback_file_count)
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -254,29 +199,20 @@ def show_summary_cards(summary_text: str, fallback_file_count: int) -> None:
         st.metric("Failed pages", metrics["Failed pages"])
 
 
-# ============================================================
-# DOWNLOAD BUTTONS
-# ============================================================
-
-
-def show_download_buttons(export_folder: Path, key_prefix: str) -> None:
-    """
-    Show download buttons for TXT ZIP and generated Excel overview.
-
-    key_prefix is required because Streamlit needs unique widget keys.
-    Without it, the same download buttons shown in multiple sections can create:
-    StreamlitDuplicateElementId.
-    """
-    zip_path = zip_folder(export_folder)
-    excel_path = export_folder / EXCEL_FILE_NAME
-
-    safe_key_prefix = (
-        key_prefix
-        .replace("\\", "_")
+def safe_key(value: str) -> str:
+    return (
+        value.replace("\\", "_")
         .replace("/", "_")
         .replace(":", "_")
         .replace(" ", "_")
+        .replace(".", "_")
     )
+
+
+def show_download_buttons(export_folder: Path, key_prefix: str) -> None:
+    zip_path = zip_folder(export_folder)
+    excel_path = export_folder / EXCEL_FILE_NAME
+    key = safe_key(key_prefix)
 
     download_col1, download_col2 = st.columns(2)
 
@@ -287,7 +223,7 @@ def show_download_buttons(export_folder: Path, key_prefix: str) -> None:
                 data=file,
                 file_name=zip_path.name,
                 mime="application/zip",
-                key=f"{safe_key_prefix}_txt_zip_download",
+                key=f"{key}_txt_zip_download",
             )
 
     with download_col2:
@@ -301,14 +237,11 @@ def show_download_buttons(export_folder: Path, key_prefix: str) -> None:
                         "application/vnd.openxmlformats-officedocument."
                         "spreadsheetml.sheet"
                     ),
-                    key=f"{safe_key_prefix}_excel_download",
+                    key=f"{key}_excel_download",
                 )
         else:
             st.warning("Excel overview was not generated.")
 
-# ============================================================
-# HEADER
-# ============================================================
 
 st.title("📚 CastorDoc Documentation Exporter")
 
@@ -319,21 +252,12 @@ Export CastorDoc / Coalesce documentation into clean files.
 The tool creates:
 
 - `.txt` files for each exported ReadMe;
-- one Excel overview workbook for business review;
+- one Excel model specification workbook;
 - one ZIP file containing the full export.
 
-It keeps only useful documentation content:
-- ReadMe content;
-- links found inside ReadMe;
-- Knowledge tiles from Subpages & Map;
-- no breadcrumbs, top menu, comments, history or sidebars.
+It now tries metadata/API extraction first, then falls back to UI scrolling/clicking.
 """
 )
-
-
-# ============================================================
-# STEP 1: LOGIN EXPLANATION
-# ============================================================
 
 st.markdown("## 1. Log in to CastorDoc")
 
@@ -343,20 +267,7 @@ st.info(
     "After login, the export continues automatically."
 )
 
-
-# ============================================================
-# STEP 2: URL INPUT
-# ============================================================
-
 st.markdown("## 2. Paste the page(s) to export")
-
-st.markdown(
-    """
-Paste one or more CastorDoc URLs below.
-
-Use the page that contains the main requirements and subpages, usually a `/map` or `/home` page.
-"""
-)
 
 root_urls_text = st.text_area(
     "CastorDoc page URL(s)",
@@ -375,33 +286,26 @@ For each URL you paste, the tool will:
 
 1. Open the page's **ReadMe**.
 2. Save only the ReadMe content.
-3. Follow only links found inside the ReadMe.
+3. Follow links found inside the ReadMe.
 4. Open **Subpages & Map** if the page depth allows it.
-5. If the page has **0 Subpages**, it keeps only the ReadMe.
-6. Collect only visible **Knowledge tiles**.
+5. Try to extract Knowledge links from metadata/API/page state.
+6. Fall back to scrolling/clicking visible Knowledge tiles.
 7. Save the ReadMe of each Knowledge tile.
-8. Stop deeper crawling after depth 3.
-9. Generate an Excel overview workbook.
+8. Stop deeper crawling after depth 3 by default.
+9. Generate an Excel model specification workbook.
 10. Skip duplicate pages automatically.
 """
     )
-
-
-# ============================================================
-# ADVANCED SETTINGS
-# ============================================================
 
 with st.expander("Advanced settings", expanded=False):
     output_root = st.text_input(
         "Export folder",
         value=DEFAULT_OUTPUT_ROOT,
-        help="Folder where export folders will be created.",
     )
 
     profile_dir = st.text_input(
         "Browser login profile",
         value=DEFAULT_PROFILE_DIR,
-        help="Keeps your CastorDoc login session between runs.",
     )
 
     max_pages = st.number_input(
@@ -418,7 +322,6 @@ with st.expander("Advanced settings", expanded=False):
         max_value=10,
         value=DEFAULT_MAX_DEPTH,
         step=1,
-        help="At this depth, pages are saved but no further links/subpages are explored.",
     )
 
     subpages_until_depth = st.number_input(
@@ -427,14 +330,12 @@ with st.expander("Advanced settings", expanded=False):
         max_value=10,
         value=DEFAULT_SUBPAGES_UNTIL_DEPTH,
         step=1,
-        help="Subpages & Map is explored only when page depth is <= this value.",
     )
 
     python_runner = st.selectbox(
         "Python runner",
         options=["uv run python", "current python", "python"],
         index=0,
-        help="Use `uv run python` if you run the project with Astral uv.",
     )
 
     show_logs = st.checkbox(
@@ -442,14 +343,9 @@ with st.expander("Advanced settings", expanded=False):
         value=True,
     )
 
-
-# ============================================================
-# STEP 3: RUN EXPORT
-# ============================================================
-
 st.markdown("## 3. Export")
 
-run_export = st.button("Export documentation", type="primary")
+run_export = st.button("🚀 Export documentation", type="primary")
 
 status_box = st.empty()
 progress_bar = st.progress(0)
@@ -470,8 +366,6 @@ if run_export:
 
     output_root_path = Path(output_root)
 
-    # Streamlit writes the root URLs to a temporary file.
-    # The exporter receives --root-urls-file, which keeps CLI handling simple.
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
@@ -508,9 +402,14 @@ if run_export:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             universal_newlines=True,
-            env=os.environ.copy(),
+            env={
+                **os.environ.copy(),
+                "PYTHONIOENCODING": "utf-8",
+            },
         )
 
         while True:
@@ -523,21 +422,32 @@ if run_export:
                 clean_line = line.rstrip()
                 logs.append(clean_line)
 
-                visited_count = sum(
-                    1 for item in logs if item.startswith("Visite ")
-                )
-
+                visited_count = sum(1 for item in logs if item.startswith("Visite "))
                 progress = min(visited_count / int(max_pages), 1.0)
                 progress_bar.progress(progress)
 
                 if show_logs:
-                    log_box.text_area(
-                        "Export logs",
-                        value="\n".join(logs[-400:]),
-                        height=420,
+                    # Avoid sending a huge websocket payload to Streamlit on every log line.
+                    # Keep only the latest logs and refresh the UI periodically.
+                    should_refresh_logs = (
+                        len(logs) % 10 == 0
+                        or "Export terminé" in clean_line
+                        or "Erreur" in clean_line
+                        or "Knowledge tiles finales" in clean_line
                     )
+
+                    if should_refresh_logs:
+                        visible_logs = "\n".join(logs[-120:])
+                        visible_logs = visible_logs[-20_000:]
+
+                        log_box.text_area(
+                            "Export logs",
+                            value=visible_logs,
+                            height=420,
+                        )
                 else:
-                    log_box.info(f"Pages visited: {visited_count}")
+                    if len(logs) % 10 == 0:
+                        log_box.info(f"Pages visited: {visited_count}")
 
             if process.poll() is not None:
                 break
@@ -593,9 +503,14 @@ if run_export:
             )
 
             if selected_file:
+                preview_text = read_text_file(selected_file)
+
+                if len(preview_text) > 30_000:
+                    preview_text = preview_text[:30_000] + "\n\n--- Preview truncated in UI. Download ZIP for full file. ---"
+
                 st.text_area(
                     selected_file.name,
-                    value=read_text_file(selected_file),
+                    value=preview_text,
                     height=420,
                 )
 
@@ -621,10 +536,6 @@ if run_export:
         except Exception:
             pass
 
-
-# ============================================================
-# PREVIOUS EXPORTS
-# ============================================================
 
 st.markdown("---")
 st.markdown("## Previous exports")
