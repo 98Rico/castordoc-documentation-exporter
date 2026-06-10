@@ -1,16 +1,25 @@
 """
 streamlit_app.py
 
-Customer-friendly Streamlit UI for export_castordoc.py.
+Customer-friendly Streamlit UI for the CastorDoc exporter.
 
-Usage with uv:
+Responsibilities
+----------------
+This file is only responsible for the user interface:
+- collect root URLs from the user;
+- run export_castordoc.py as a subprocess;
+- show logs and export results;
+- provide download buttons for TXT ZIP and Excel overview.
 
+It does NOT scrape CastorDoc itself.
+It does NOT build the Excel workbook itself.
+
+The exporter generates Excel automatically because Streamlit passes:
+    --generate-excel
+
+Usage with uv
+-------------
     uv run streamlit run streamlit_app.py
-
-Dependencies:
-
-    uv add streamlit playwright
-    uv run playwright install chromium
 """
 
 from __future__ import annotations
@@ -38,21 +47,25 @@ st.set_page_config(
 
 
 # ============================================================
-# CONSTANTS
+# DEFAULT SETTINGS
 # ============================================================
 
 DEFAULT_OUTPUT_ROOT = "Output"
 DEFAULT_PROFILE_DIR = "playwright_profile"
-DEFAULT_MAX_PAGES = 200
-DEFAULT_MAX_LINK_DEPTH = 2
+DEFAULT_MAX_PAGES = 250
+DEFAULT_MAX_DEPTH = 3
+DEFAULT_SUBPAGES_UNTIL_DEPTH = 2
+
+EXCEL_FILE_NAME = "castordoc_documentation_overview.xlsx"
 
 
 # ============================================================
-# HELPERS
+# FILE HELPERS
 # ============================================================
 
 
 def get_latest_export_folder(output_root: Path) -> Path | None:
+    """Return the most recently modified CastorDoc export folder."""
     if not output_root.exists():
         return None
 
@@ -69,6 +82,7 @@ def get_latest_export_folder(output_root: Path) -> Path | None:
 
 
 def list_export_folders(output_root: Path) -> list[Path]:
+    """List previous export folders newest first."""
     if not output_root.exists():
         return []
 
@@ -84,13 +98,19 @@ def list_export_folders(output_root: Path) -> list[Path]:
 
 
 def list_txt_files(folder_path: Path) -> list[Path]:
+    """List exported documentation TXT files, excluding export_summary.txt."""
     if not folder_path or not folder_path.exists():
         return []
 
-    return sorted(folder_path.glob("*.txt"))
+    return sorted(
+        path
+        for path in folder_path.glob("*.txt")
+        if path.name != "export_summary.txt"
+    )
 
 
 def zip_folder(folder_path: Path) -> Path:
+    """Zip an export folder so the user can download all TXT files."""
     zip_path = folder_path.with_suffix(".zip")
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -102,6 +122,7 @@ def zip_folder(folder_path: Path) -> Path:
 
 
 def read_text_file(path: Path) -> str:
+    """Read a text file safely for preview in Streamlit."""
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -111,6 +132,7 @@ def read_text_file(path: Path) -> str:
 
 
 def parse_urls_from_text(text: str) -> list[str]:
+    """Parse one URL per line from the Streamlit textarea."""
     urls = []
 
     for line in text.splitlines():
@@ -127,6 +149,11 @@ def parse_urls_from_text(text: str) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+# ============================================================
+# COMMAND BUILDING
+# ============================================================
+
+
 def build_command(
     python_runner: str,
     exporter_path: Path,
@@ -134,8 +161,15 @@ def build_command(
     output_root: str,
     profile_dir: str,
     max_pages: int,
-    max_link_depth: int,
+    max_depth: int,
+    subpages_until_depth: int,
 ) -> list[str]:
+    """
+    Build the command used to launch export_castordoc.py.
+
+    We run the exporter as a subprocess instead of importing it directly because
+    Playwright + visible Chromium is more reliable outside Streamlit's rerun cycle.
+    """
     if python_runner == "uv run python":
         command_prefix = ["uv", "run", "python"]
     elif python_runner == "current python":
@@ -154,17 +188,27 @@ def build_command(
         profile_dir,
         "--max-pages",
         str(max_pages),
-        "--max-link-depth",
-        str(max_link_depth),
+        "--max-depth",
+        str(max_depth),
+        "--subpages-until-depth",
+        str(subpages_until_depth),
+        "--generate-excel",
     ]
 
 
-def show_summary_cards(summary_text: str, fallback_file_count: int) -> None:
+# ============================================================
+# SUMMARY PARSING FOR UI
+# ============================================================
+
+
+def parse_summary_metrics(summary_text: str, fallback_file_count: int) -> dict[str, str]:
+    """Parse export_summary.txt into user-facing metrics."""
     metrics = {
         "Root pages": "0",
-        "Subpages": "0",
-        "ReadMe linked pages": "0",
+        "ReadMe links": "0",
+        "Knowledge tiles": "0",
         "Saved files": str(fallback_file_count),
+        "Failed pages": "0",
     }
 
     for line in summary_text.splitlines():
@@ -173,29 +217,94 @@ def show_summary_cards(summary_text: str, fallback_file_count: int) -> None:
         if clean.startswith("- root_saved:"):
             metrics["Root pages"] = clean.split(":", 1)[1].strip()
 
-        elif clean.startswith("- subpage_saved:"):
-            metrics["Subpages"] = clean.split(":", 1)[1].strip()
-
         elif clean.startswith("- readme_link_saved:"):
-            metrics["ReadMe linked pages"] = clean.split(":", 1)[1].strip()
+            metrics["ReadMe links"] = clean.split(":", 1)[1].strip()
+
+        elif clean.startswith("- knowledge_tile_saved:"):
+            metrics["Knowledge tiles"] = clean.split(":", 1)[1].strip()
 
         elif clean.startswith("SAVED_URLS:"):
             metrics["Saved files"] = clean.split(":", 1)[1].strip()
 
-    col1, col2, col3, col4 = st.columns(4)
+        elif clean.startswith("FAILED_URLS:"):
+            metrics["Failed pages"] = clean.split(":", 1)[1].strip()
+
+    return metrics
+
+
+def show_summary_cards(summary_text: str, fallback_file_count: int) -> None:
+    """Display export KPIs as Streamlit metric cards."""
+    metrics = parse_summary_metrics(summary_text, fallback_file_count)
+
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         st.metric("Root pages", metrics["Root pages"])
 
     with col2:
-        st.metric("Subpages", metrics["Subpages"])
+        st.metric("ReadMe links", metrics["ReadMe links"])
 
     with col3:
-        st.metric("Linked pages", metrics["ReadMe linked pages"])
+        st.metric("Knowledge tiles", metrics["Knowledge tiles"])
 
     with col4:
         st.metric("Saved files", metrics["Saved files"])
 
+    with col5:
+        st.metric("Failed pages", metrics["Failed pages"])
+
+
+# ============================================================
+# DOWNLOAD BUTTONS
+# ============================================================
+
+
+def show_download_buttons(export_folder: Path, key_prefix: str) -> None:
+    """
+    Show download buttons for TXT ZIP and generated Excel overview.
+
+    key_prefix is required because Streamlit needs unique widget keys.
+    Without it, the same download buttons shown in multiple sections can create:
+    StreamlitDuplicateElementId.
+    """
+    zip_path = zip_folder(export_folder)
+    excel_path = export_folder / EXCEL_FILE_NAME
+
+    safe_key_prefix = (
+        key_prefix
+        .replace("\\", "_")
+        .replace("/", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+    download_col1, download_col2 = st.columns(2)
+
+    with download_col1:
+        with open(zip_path, "rb") as file:
+            st.download_button(
+                label="⬇️ Download TXT ZIP",
+                data=file,
+                file_name=zip_path.name,
+                mime="application/zip",
+                key=f"{safe_key_prefix}_txt_zip_download",
+            )
+
+    with download_col2:
+        if excel_path.exists():
+            with open(excel_path, "rb") as file:
+                st.download_button(
+                    label="⬇️ Download Excel Overview",
+                    data=file,
+                    file_name=excel_path.name,
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    key=f"{safe_key_prefix}_excel_download",
+                )
+        else:
+            st.warning("Excel overview was not generated.")
 
 # ============================================================
 # HEADER
@@ -205,18 +314,25 @@ st.title("📚 CastorDoc Documentation Exporter")
 
 st.markdown(
     """
-Use this tool to export CastorDoc / Coalesce documentation into clean text files.
+Export CastorDoc / Coalesce documentation into clean files.
 
-It saves:
-- the **ReadMe of the page you provide**;
-- the **ReadMe of its subpages**;
-- the **ReadMe of useful CastorDoc links found inside those pages**.
+The tool creates:
+
+- `.txt` files for each exported ReadMe;
+- one Excel overview workbook for business review;
+- one ZIP file containing the full export.
+
+It keeps only useful documentation content:
+- ReadMe content;
+- links found inside ReadMe;
+- Knowledge tiles from Subpages & Map;
+- no breadcrumbs, top menu, comments, history or sidebars.
 """
 )
 
 
 # ============================================================
-# SIMPLE USER FLOW
+# STEP 1: LOGIN EXPLANATION
 # ============================================================
 
 st.markdown("## 1. Log in to CastorDoc")
@@ -224,17 +340,21 @@ st.markdown("## 1. Log in to CastorDoc")
 st.info(
     "When you start an export, a Chromium browser will open. "
     "If CastorDoc asks you to log in, log in manually. "
-    "After that, the export continues automatically."
+    "After login, the export continues automatically."
 )
 
-st.markdown("## 2. Choose the documentation page(s) to export")
+
+# ============================================================
+# STEP 2: URL INPUT
+# ============================================================
+
+st.markdown("## 2. Paste the page(s) to export")
 
 st.markdown(
     """
 Paste one or more CastorDoc URLs below.
 
-Use the page that contains the main requirements and subpages, usually a `/map` page.
-The exporter will also save that root page's own ReadMe.
+Use the page that contains the main requirements and subpages, usually a `/map` or `/home` page.
 """
 )
 
@@ -248,17 +368,21 @@ root_urls_text = st.text_area(
     ),
 )
 
-with st.expander("What will be exported?", expanded=False):
+with st.expander("What exactly will be exported?", expanded=False):
     st.markdown(
         """
 For each URL you paste, the tool will:
 
-1. Open the page and save its **ReadMe**.
-2. Open **Subpages & Map** and find direct subpages.
-3. Save the **ReadMe** of each subpage.
-4. Look inside each ReadMe for other CastorDoc documentation links.
-5. Save the **ReadMe** of those linked pages too.
-6. Skip duplicates automatically.
+1. Open the page's **ReadMe**.
+2. Save only the ReadMe content.
+3. Follow only links found inside the ReadMe.
+4. Open **Subpages & Map** if the page depth allows it.
+5. If the page has **0 Subpages**, it keeps only the ReadMe.
+6. Collect only visible **Knowledge tiles**.
+7. Save the ReadMe of each Knowledge tile.
+8. Stop deeper crawling after depth 3.
+9. Generate an Excel overview workbook.
+10. Skip duplicate pages automatically.
 """
     )
 
@@ -271,7 +395,7 @@ with st.expander("Advanced settings", expanded=False):
     output_root = st.text_input(
         "Export folder",
         value=DEFAULT_OUTPUT_ROOT,
-        help="Folder where exports will be created.",
+        help="Folder where export folders will be created.",
     )
 
     profile_dir = st.text_input(
@@ -288,22 +412,23 @@ with st.expander("Advanced settings", expanded=False):
         step=25,
     )
 
-    crawl_mode = st.radio(
-        "How far should linked pages be followed?",
-        options=[
-            "Root + subpages only",
-            "Root + subpages + links inside ReadMe",
-            "Deeper crawl",
-        ],
-        index=1,
+    max_depth = st.number_input(
+        "Maximum depth",
+        min_value=0,
+        max_value=10,
+        value=DEFAULT_MAX_DEPTH,
+        step=1,
+        help="At this depth, pages are saved but no further links/subpages are explored.",
     )
 
-    if crawl_mode == "Root + subpages only":
-        max_link_depth = 0
-    elif crawl_mode == "Root + subpages + links inside ReadMe":
-        max_link_depth = 1
-    else:
-        max_link_depth = DEFAULT_MAX_LINK_DEPTH
+    subpages_until_depth = st.number_input(
+        "Explore Subpages & Map until depth",
+        min_value=0,
+        max_value=10,
+        value=DEFAULT_SUBPAGES_UNTIL_DEPTH,
+        step=1,
+        help="Subpages & Map is explored only when page depth is <= this value.",
+    )
 
     python_runner = st.selectbox(
         "Python runner",
@@ -319,12 +444,12 @@ with st.expander("Advanced settings", expanded=False):
 
 
 # ============================================================
-# EXPORT BUTTON
+# STEP 3: RUN EXPORT
 # ============================================================
 
 st.markdown("## 3. Export")
 
-run_export = st.button("🚀 Export documentation", type="primary")
+run_export = st.button("Export documentation", type="primary")
 
 status_box = st.empty()
 progress_bar = st.progress(0)
@@ -345,6 +470,8 @@ if run_export:
 
     output_root_path = Path(output_root)
 
+    # Streamlit writes the root URLs to a temporary file.
+    # The exporter receives --root-urls-file, which keeps CLI handling simple.
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".txt",
@@ -363,7 +490,8 @@ if run_export:
         output_root=output_root,
         profile_dir=profile_dir,
         max_pages=int(max_pages),
-        max_link_depth=int(max_link_depth),
+        max_depth=int(max_depth),
+        subpages_until_depth=int(subpages_until_depth),
     )
 
     status_box.info(
@@ -471,19 +599,13 @@ if run_export:
                     height=420,
                 )
 
-            zip_path = zip_folder(latest_folder)
-
-            with open(zip_path, "rb") as file:
-                st.download_button(
-                    label="⬇️ Download ZIP",
-                    data=file,
-                    file_name=zip_path.name,
-                    mime="application/zip",
-                )
-        else:
-            st.warning(
-                "No `.txt` files were exported. Check the summary and logs."
+            show_download_buttons(
+                export_folder=latest_folder,
+                key_prefix=f"latest_{latest_folder.name}",
             )
+
+        else:
+            st.warning("No `.txt` files were exported. Check the summary and logs.")
 
     except FileNotFoundError:
         st.error(
@@ -553,12 +675,7 @@ else:
                 height=350,
             )
 
-            previous_zip_path = zip_folder(selected_export)
-
-            with open(previous_zip_path, "rb") as file:
-                st.download_button(
-                    label="⬇️ Download previous export ZIP",
-                    data=file,
-                    file_name=previous_zip_path.name,
-                    mime="application/zip",
-                )
+            show_download_buttons(
+                export_folder=selected_export,
+                key_prefix=f"previous_{selected_export.name}",
+            )
